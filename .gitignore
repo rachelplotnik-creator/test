@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+
+# Locally-uploaded Tatari CSVs are user data; keep them out of git.
+data/*
+!data/.gitkeep
