@@ -249,10 +249,23 @@ def _infer_airtable_type(series: pd.Series) -> tuple[str, dict | None]:
     return "singleLineText", None
 
 
+def _is_permission_error(exc: Exception) -> bool:
+    """True if the Airtable error indicates a missing scope / permission."""
+    msg = str(exc).upper()
+    return (
+        "401" in msg
+        or "403" in msg
+        or "INVALID_PERMISSIONS" in msg
+        or "NOT_AUTHORIZED" in msg
+        or "AUTHENTICATION_REQUIRED" in msg
+    )
+
+
 def ensure_data_fields(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Create raw_data fields for any CSV columns that don't exist yet.
 
     Returns (created_field_names, skipped_field_names_due_to_error).
+    Raises SchemaPermissionError if the PAT lacks the schema scopes.
     """
     existing = _existing_field_names(RAW_DATA_TABLE)
     table = _table_with_schema(RAW_DATA_TABLE)
@@ -270,14 +283,27 @@ def ensure_data_fields(df: pd.DataFrame) -> tuple[list[str], list[str]]:
                 table.create_field(col, ftype)
             existing.add(col)
             created.append(col)
-        except Exception:  # noqa: BLE001
-            # Fall back to a single-line text field if the inferred type
-            # was rejected (e.g. mixed data).
+        except Exception as exc:  # noqa: BLE001
+            if _is_permission_error(exc):
+                raise SchemaPermissionError(
+                    "Your Airtable token can't modify the table schema. "
+                    "Go to airtable.com/create/tokens, open your token, and "
+                    "add the 'schema.bases:read' and 'schema.bases:write' "
+                    "scopes (you don't need to regenerate the token — adding "
+                    "scopes keeps the same value). Then restart the app."
+                ) from exc
+            # Type was likely rejected (e.g. mixed data) — fall back to text.
             try:
                 table.create_field(col, "singleLineText")
                 existing.add(col)
                 created.append(col)
-            except Exception:  # noqa: BLE001
+            except Exception as exc2:  # noqa: BLE001
+                if _is_permission_error(exc2):
+                    raise SchemaPermissionError(
+                        "Your Airtable token can't modify the table schema. "
+                        "Add 'schema.bases:read' and 'schema.bases:write' scopes "
+                        "to your token at airtable.com/create/tokens."
+                    ) from exc2
                 skipped.append(col)
 
     _SCHEMA_CACHE[RAW_DATA_TABLE] = existing
@@ -366,21 +392,21 @@ def upload_to_airtable(uploaded_file, week_label: str, upload_ts: str) -> int:
     raw = coerce_dates(raw)
 
     # Sync schema: create Airtable fields for any new columns
-    try:
-        ensure_data_fields(raw)
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc)
-        if "401" in msg or "403" in msg or "INVALID_PERMISSIONS" in msg or "NOT_AUTHORIZED" in msg:
-            raise SchemaPermissionError(
-                "Your Airtable token can't modify the table schema. "
-                "Update the token at airtable.com/create/tokens to include "
-                "'schema.bases:read' and 'schema.bases:write' scopes, then "
-                "paste the new token into .streamlit/secrets.toml."
-            ) from exc
-        raise
+    _, skipped = ensure_data_fields(raw)
 
-    # Build dedupe signature from the current data columns
-    data_cols = [c for c in raw.columns if c not in RESERVED_FIELDS]
+    # Refresh and use the live schema as the source of truth: only write to
+    # fields that actually exist in the table.
+    available_fields = _existing_field_names(RAW_DATA_TABLE, refresh=True)
+    if skipped:
+        st.warning(
+            "These CSV columns couldn't be added to Airtable and will be "
+            "skipped for this upload: " + ", ".join(skipped)
+        )
+
+    data_cols = [
+        c for c in raw.columns
+        if c not in RESERVED_FIELDS and c in available_fields
+    ]
     new_rows = [_row_to_airtable({k: r.get(k) for k in data_cols})
                 for r in raw.to_dict(orient="records")]
     new_signatures = [
