@@ -1,12 +1,17 @@
 """Tatari TV Campaign Performance Dashboard.
 
-Upload Tatari CSV exports through the sidebar. Each upload is appended to a
-Google Sheet (two worksheets: ``raw_data`` and ``uploads_log``) so the data
+Upload Tatari CSV exports through the sidebar. Each upload is appended to an
+Airtable base (two tables: ``raw_data`` and ``uploads_log``) so the data
 persists across sessions and deployments.
 
 Required Streamlit secrets (see .streamlit/secrets.toml.example):
-    GOOGLE_SHEET_URL   - full URL of your Google Sheet
-    GOOGLE_CREDENTIALS - service-account JSON (as a TOML table or JSON string)
+    AIRTABLE_BASE_ID  - your Airtable base ID (starts with "app")
+    AIRTABLE_PAT      - personal access token (starts with "pat")
+
+Each row of the original CSV is stored as one Airtable record in ``raw_data``.
+The dynamic per-row column data is JSON-encoded into the ``row_data`` long-text
+field, so the Airtable schema is fixed regardless of which columns Tatari
+exports include.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ IMPRESSION_HINTS = ("impressions", "imps", "impression")
 CPE_HINTS = ("cpe", "cost_per_engagement", "cost_per_visit", "cpv")
 CPM_HINTS = ("cpm", "cost_per_mille", "cost_per_thousand")
 
-# Internal bookkeeping columns added by the app — excluded from dedup / filters.
+# Bookkeeping columns the app adds — excluded from dedup / filters / charts.
 META_COLS = {"_week_label", "_upload_ts", "_source_file"}
 
 COLUMN_SYNONYMS: dict[str, str] = {
@@ -58,6 +63,10 @@ COLUMN_SYNONYMS: dict[str, str] = {
     "imps": "impressions",
     "impression": "impressions",
 }
+
+RAW_DATA_TABLE = "raw_data"
+UPLOADS_LOG_TABLE = "uploads_log"
+
 
 # ---------------------------------------------------------------------------
 # Column / dtype helpers
@@ -83,7 +92,6 @@ def is_rate_col(col: str) -> bool:
 
 
 def coerce_dates(df: pd.DataFrame) -> pd.DataFrame:
-    """Auto-detect and parse date columns."""
     df = df.copy()
     name_hints = ("date", "day", "week", "month", "timestamp", "time")
     for col in df.columns:
@@ -128,176 +136,170 @@ def week_label_from_date(d: _dt.date) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets client
+# Airtable client
 # ---------------------------------------------------------------------------
-
-def _creds_dict() -> dict:
-    """Extract service-account credentials from st.secrets."""
-    raw = st.secrets["GOOGLE_CREDENTIALS"]
-    if isinstance(raw, str):
-        return json.loads(raw)
-    # AttrDict / toml table — convert to plain dict recursively.
-    return json.loads(json.dumps(dict(raw)))
-
-
-@st.cache_resource(show_spinner=False)
-def _gspread_client():
-    """Return an authenticated gspread client (cached for the process lifetime)."""
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(_creds_dict(), scopes=scopes)
-    return gspread.authorize(creds)
-
-
-def _open_sheet():
-    gc = _gspread_client()
-    return gc.open_by_url(st.secrets["GOOGLE_SHEET_URL"])
-
-
-def _get_worksheets():
-    """Return (raw_data_ws, uploads_log_ws), creating them if absent."""
-    import gspread
-
-    sh = _open_sheet()
-
-    def get_or_create(name: str, rows: int = 10000, cols: int = 60):
-        try:
-            return sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            return sh.add_worksheet(title=name, rows=rows, cols=cols)
-
-    return get_or_create("raw_data"), get_or_create("uploads_log", rows=2000, cols=10)
-
 
 def _secrets_configured() -> bool:
     try:
-        _ = st.secrets["GOOGLE_SHEET_URL"]
-        _ = st.secrets["GOOGLE_CREDENTIALS"]
+        _ = st.secrets["AIRTABLE_BASE_ID"]
+        _ = st.secrets["AIRTABLE_PAT"]
         return True
     except (KeyError, FileNotFoundError):
         return False
+
+
+@st.cache_resource(show_spinner=False)
+def _airtable_api():
+    """Return an authenticated pyairtable Api (cached for process lifetime)."""
+    from pyairtable import Api
+    return Api(st.secrets["AIRTABLE_PAT"])
+
+
+def _table(name: str):
+    return _airtable_api().table(st.secrets["AIRTABLE_BASE_ID"], name)
 
 
 # ---------------------------------------------------------------------------
 # Storage operations
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
+def _row_to_jsonable(row: dict) -> dict:
+    """Convert a pandas row dict to plain JSON-serialisable types."""
+    out: dict = {}
+    for k, v in row.items():
+        if pd.isna(v):
+            continue
+        if isinstance(v, pd.Timestamp):
+            out[k] = v.strftime("%Y-%m-%d") if v == v.normalize() else v.isoformat()
+        elif isinstance(v, _dt.datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, _dt.date):
+            out[k] = v.isoformat()
+        elif isinstance(v, np.integer):
+            out[k] = int(v)
+        elif isinstance(v, np.floating):
+            out[k] = float(v)
+        elif isinstance(v, np.bool_):
+            out[k] = bool(v)
+        else:
+            out[k] = v
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=60)
 def _load_raw_data(cache_bust: int) -> pd.DataFrame:  # noqa: ARG001
-    """Read the raw_data worksheet into a DataFrame."""
-    from gspread_dataframe import get_as_dataframe
+    """Read all rows from the raw_data table and explode JSON back to columns."""
+    records = _table(RAW_DATA_TABLE).all()
+    if not records:
+        return pd.DataFrame()
 
-    raw_ws, _ = _get_worksheets()
-    df = get_as_dataframe(raw_ws, evaluate_formulas=False, dtype=str)
-    df = df.dropna(how="all").reset_index(drop=True)
-    return df
+    rows: list[dict] = []
+    for rec in records:
+        fields = rec.get("fields", {})
+        row_blob = fields.get("row_data", "")
+        try:
+            row = json.loads(row_blob) if row_blob else {}
+        except json.JSONDecodeError:
+            row = {}
+        # Promote meta fields from the Airtable record itself onto the row.
+        row["_upload_ts"] = fields.get("upload_ts", "")
+        row["_week_label"] = fields.get("week_label", "")
+        row["_source_file"] = fields.get("source_file", "")
+        row["_record_id"] = rec.get("id", "")
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def _load_uploads_log(cache_bust: int) -> pd.DataFrame:  # noqa: ARG001
-    from gspread_dataframe import get_as_dataframe
+    records = _table(UPLOADS_LOG_TABLE).all()
+    if not records:
+        return pd.DataFrame()
 
-    _, log_ws = _get_worksheets()
-    df = get_as_dataframe(log_ws, evaluate_formulas=False, dtype=str)
-    return df.dropna(how="all").reset_index(drop=True)
+    rows = []
+    for rec in records:
+        f = rec.get("fields", {})
+        rows.append({
+            "upload_ts":         f.get("upload_ts", ""),
+            "week_label":        f.get("week_label", ""),
+            "original_filename": f.get("original_filename", ""),
+            "row_count":         f.get("row_count", 0),
+            "_record_id":        rec.get("id", ""),
+        })
+    return pd.DataFrame(rows)
 
 
 def _invalidate_cache() -> None:
-    """Bump the session-state counter so cached sheet reads are re-fetched."""
     st.session_state["_cache_bust"] = st.session_state.get("_cache_bust", 0) + 1
     _load_raw_data.clear()
     _load_uploads_log.clear()
 
 
-def _write_raw_data(df: pd.DataFrame) -> None:
-    from gspread_dataframe import set_with_dataframe
+def upload_to_airtable(uploaded_file, week_label: str, upload_ts: str) -> int:
+    """Parse a CSV, dedupe vs existing data, and batch-create new records.
 
-    raw_ws, _ = _get_worksheets()
-    # Convert datetime columns to ISO strings so gspread can serialise them.
-    out = df.copy()
-    for col in out.columns:
-        if pd.api.types.is_datetime64_any_dtype(out[col]):
-            out[col] = out[col].dt.strftime("%Y-%m-%d").where(out[col].notna(), "")
-    raw_ws.clear()
-    set_with_dataframe(raw_ws, out, include_index=False)
-
-
-def _append_upload_log(upload_ts: str, week_label: str, filename: str, row_count: int) -> None:
-    from gspread_dataframe import get_as_dataframe, set_with_dataframe
-
-    _, log_ws = _get_worksheets()
-    existing = get_as_dataframe(log_ws, evaluate_formulas=False, dtype=str).dropna(how="all")
-    new_row = pd.DataFrame([{
-        "upload_ts": upload_ts,
-        "week_label": week_label,
-        "original_filename": filename,
-        "row_count": str(row_count),
-    }])
-    combined = pd.concat([existing, new_row], ignore_index=True)
-    log_ws.clear()
-    set_with_dataframe(log_ws, combined, include_index=False)
-
-
-def upload_to_sheets(uploaded_file, week_label: str, upload_ts: str) -> int:
-    """Parse an uploaded CSV, tag it, merge into raw_data, and log it.
-
-    Returns the number of new (non-duplicate) rows added.
+    Returns the number of new records actually written.
     """
     raw = pd.read_csv(uploaded_file)
     raw.columns = [normalize_col(c) for c in raw.columns]
     raw = coerce_dates(raw)
-    raw["_week_label"] = week_label
-    raw["_upload_ts"] = upload_ts
-    raw["_source_file"] = uploaded_file.name
 
-    # Stringify datetimes before storing so all values are plain strings in
-    # the sheet; coerce_dates will re-parse them on load.
-    for col in raw.columns:
-        if pd.api.types.is_datetime64_any_dtype(raw[col]):
-            raw[col] = raw[col].dt.strftime("%Y-%m-%d").where(raw[col].notna(), "")
+    # Build dedupe signature for each new row from its data columns only.
+    new_rows = [_row_to_jsonable(r) for r in raw.to_dict(orient="records")]
+    new_signatures = [
+        json.dumps(r, sort_keys=True, default=str) for r in new_rows
+    ]
 
-    existing_df = _load_raw_data(st.session_state.get("_cache_bust", 0))
+    # Pull existing signatures so we can dedupe before writing.
+    existing = _load_raw_data(st.session_state.get("_cache_bust", 0))
+    existing_sigs: set[str] = set()
+    if not existing.empty:
+        data_cols = [c for c in existing.columns if c not in META_COLS and c != "_record_id"]
+        for r in existing[data_cols].to_dict(orient="records"):
+            existing_sigs.add(json.dumps(_row_to_jsonable(r), sort_keys=True, default=str))
 
-    if existing_df.empty:
-        combined = raw
-    else:
-        combined = pd.concat([existing_df, raw], ignore_index=True, sort=False)
-        # Dedupe on campaign data columns only (ignore meta bookkeeping cols).
-        dedupe_cols = [c for c in combined.columns if c not in META_COLS]
-        combined = combined.drop_duplicates(subset=dedupe_cols, keep="first")
+    new_records = []
+    for row, sig in zip(new_rows, new_signatures):
+        if sig in existing_sigs:
+            continue
+        existing_sigs.add(sig)
+        new_records.append({
+            "upload_ts":  upload_ts,
+            "week_label": week_label,
+            "source_file": uploaded_file.name,
+            "row_data":   json.dumps(row, default=str),
+        })
 
-    new_rows = len(combined) - len(existing_df)
-    _write_raw_data(combined)
-    _append_upload_log(upload_ts, week_label, uploaded_file.name, max(new_rows, 0))
-    return max(new_rows, 0)
+    if new_records:
+        _table(RAW_DATA_TABLE).batch_create(new_records, typecast=True)
+
+    _table(UPLOADS_LOG_TABLE).create({
+        "upload_ts":         upload_ts,
+        "week_label":        week_label,
+        "original_filename": uploaded_file.name,
+        "row_count":         len(new_records),
+    }, typecast=True)
+
+    return len(new_records)
 
 
 def delete_upload_batch(upload_ts: str) -> None:
-    """Remove all raw_data rows for a given upload batch and its log entry."""
-    from gspread_dataframe import get_as_dataframe, set_with_dataframe
+    """Delete all raw_data records and the log entry for a given upload batch."""
+    raw_table = _table(RAW_DATA_TABLE)
+    log_table = _table(UPLOADS_LOG_TABLE)
 
-    raw_ws, log_ws = _get_worksheets()
+    formula = f"{{upload_ts}}='{upload_ts}'"
+    raw_records = raw_table.all(formula=formula, fields=[])
+    if raw_records:
+        raw_table.batch_delete([r["id"] for r in raw_records])
 
-    raw_df = get_as_dataframe(raw_ws, evaluate_formulas=False, dtype=str).dropna(how="all")
-    if "_upload_ts" in raw_df.columns:
-        raw_df = raw_df[raw_df["_upload_ts"] != upload_ts]
-    raw_ws.clear()
-    set_with_dataframe(raw_ws, raw_df, include_index=False)
-
-    log_df = get_as_dataframe(log_ws, evaluate_formulas=False, dtype=str).dropna(how="all")
-    if "upload_ts" in log_df.columns:
-        log_df = log_df[log_df["upload_ts"] != upload_ts]
-    log_ws.clear()
-    set_with_dataframe(log_ws, log_df, include_index=False)
+    log_records = log_table.all(formula=formula, fields=[])
+    if log_records:
+        log_table.batch_delete([r["id"] for r in log_records])
 
 
 def load_selected_batches(selected_ts: list[str]) -> pd.DataFrame:
-    """Return a processed DataFrame filtered to the selected upload batches."""
     bust = st.session_state.get("_cache_bust", 0)
     raw = _load_raw_data(bust)
     if raw.empty:
@@ -306,8 +308,11 @@ def load_selected_batches(selected_ts: list[str]) -> pd.DataFrame:
         raw = raw[raw["_upload_ts"].isin(selected_ts)]
     if raw.empty:
         return pd.DataFrame()
+
+    raw = raw.drop(columns=[c for c in ["_record_id"] if c in raw.columns])
     df = coerce_dates(raw)
-    # Dedupe on campaign data columns only.
+
+    # Dedupe again just in case (cheap insurance).
     dedupe_cols = [c for c in df.columns if c not in META_COLS]
     df = df.drop_duplicates(subset=dedupe_cols, keep="first")
     return df.reset_index(drop=True)
@@ -318,7 +323,6 @@ def load_selected_batches(selected_ts: list[str]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def aggregate_weekly(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
-    """Aggregate numeric columns by ISO week (Mon–Sun)."""
     if df.empty or date_col is None or date_col not in df.columns:
         return pd.DataFrame()
 
@@ -331,6 +335,19 @@ def aggregate_weekly(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
     work["_iso_week"] = iso["week"].astype(int)
     work["_week_start"] = work[date_col] - pd.to_timedelta(work[date_col].dt.weekday, unit="D")
     work["_week_start"] = work["_week_start"].dt.normalize()
+
+    # Coerce columns that look numeric but came back as strings (Airtable
+    # round-trips everything as JSON, so a column might be all stringly).
+    for col in work.columns:
+        if col in META_COLS or col in {"_iso_year", "_iso_week", "_week_start"}:
+            continue
+        if pd.api.types.is_numeric_dtype(work[col]):
+            continue
+        if pd.api.types.is_datetime64_any_dtype(work[col]):
+            continue
+        coerced = pd.to_numeric(work[col], errors="coerce")
+        if coerced.notna().sum() >= max(1, int(0.6 * work[col].notna().sum())):
+            work[col] = coerced
 
     numeric_cols = [
         c for c in work.columns
@@ -443,13 +460,13 @@ def render_kpis(weekly: pd.DataFrame) -> None:
 
     cards = []
     if spend_col:
-        cards.append(("Total Spend",        f"${target[spend_col]:,.2f}"))
+        cards.append(("Total Spend",       f"${target[spend_col]:,.2f}"))
     if imp_col:
-        cards.append(("Total Impressions",  f"{target[imp_col]:,.0f}"))
+        cards.append(("Total Impressions", f"{target[imp_col]:,.0f}"))
     if cpe_col:
-        cards.append(("Avg CPE",            f"${target[cpe_col]:,.2f}"))
+        cards.append(("Avg CPE",           f"${target[cpe_col]:,.2f}"))
     if cpm_col:
-        cards.append(("Avg CPM",            f"${target[cpm_col]:,.2f}"))
+        cards.append(("Avg CPM",           f"${target[cpm_col]:,.2f}"))
 
     if not cards:
         st.info("No recognizable KPI columns (spend / impressions / CPE / CPM) in the data.")
@@ -554,10 +571,8 @@ def render_trend_charts(weekly: pd.DataFrame) -> None:
 
 
 def render_uploader_and_picker() -> list[str]:
-    """Render upload UI and batch picker. Returns list of selected upload_ts values."""
     st.sidebar.header("Data")
 
-    # --- Week label picker ---
     today = _dt.date.today()
     default_monday = today - _dt.timedelta(days=today.weekday())
     week_input = st.sidebar.date_input(
@@ -575,26 +590,24 @@ def render_uploader_and_picker() -> list[str]:
         f"({monday} – {monday + _dt.timedelta(days=6)})"
     )
 
-    # --- File uploader ---
     uploaded_files = st.sidebar.file_uploader(
         "Upload Tatari CSV export(s)",
         type=["csv"],
         accept_multiple_files=True,
-        help="Rows are appended to your Google Sheet with a week label.",
+        help="Rows are appended to your Airtable base with a week label.",
     )
     if uploaded_files:
         upload_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         for f in uploaded_files:
             with st.sidebar.status(f"Uploading {f.name}…", expanded=False):
                 try:
-                    added = upload_to_sheets(f, wlabel, upload_ts)
+                    added = upload_to_airtable(f, wlabel, upload_ts)
                     st.sidebar.success(f"{wlabel} · {f.name} (+{added:,} rows)")
                 except Exception as exc:  # noqa: BLE001
                     st.sidebar.error(f"Failed: {exc}")
         _invalidate_cache()
         st.rerun()
 
-    # --- Batch picker ---
     bust = st.session_state.get("_cache_bust", 0)
     log_df = _load_uploads_log(bust)
 
@@ -602,13 +615,16 @@ def render_uploader_and_picker() -> list[str]:
         st.sidebar.info("No uploads yet.")
         return []
 
-    # Build display labels: "2026-W19 · my_export.csv (1,234 rows)"
     log_df = log_df.sort_values("upload_ts", ascending=False).reset_index(drop=True)
 
     def batch_label(row) -> str:
-        wk  = row.get("week_label", "?")
-        fn  = row.get("original_filename", "unknown")
-        rc  = row.get("row_count", "?")
+        wk = row.get("week_label", "?")
+        fn = row.get("original_filename", "unknown")
+        rc = row.get("row_count", "?")
+        try:
+            rc = f"{int(float(rc)):,}"
+        except (TypeError, ValueError):
+            pass
         return f"{wk}  ·  {fn}  ({rc} rows)"
 
     all_ts = log_df["upload_ts"].tolist()
@@ -641,42 +657,44 @@ def render_uploader_and_picker() -> list[str]:
 
 
 def render_setup_guide() -> None:
-    st.error("Google Sheets credentials not configured.", icon="🔑")
+    st.error("Airtable credentials not configured.", icon="🔑")
     st.markdown("""
-### One-time setup (≈ 5 minutes)
+### One-time setup (~5 minutes)
 
-**1. Create a Google Cloud service account**
-- Go to [console.cloud.google.com](https://console.cloud.google.com) → *APIs & Services* → *Credentials*
-- Create a **Service Account**, then add a JSON key and download it
+**1. Create an Airtable base**
+- Sign up at [airtable.com](https://airtable.com) (free)
+- Create a base called `Tatari`
 
-**2. Enable the Google Sheets API**
-- In the same project: *APIs & Services* → *Enable APIs* → search **Google Sheets API** → Enable
+**2. Create the `raw_data` table** with these fields:
+- `upload_ts` (Single line text)
+- `week_label` (Single line text)
+- `source_file` (Single line text)
+- `row_data` (Long text)
 
-**3. Create a Google Sheet and share it**
-- Create a new Google Sheet at [sheets.google.com](https://sheets.google.com)
-- Click **Share** and add the service account email (looks like `name@project.iam.gserviceaccount.com`) with **Editor** access
+**3. Create the `uploads_log` table** with these fields:
+- `upload_ts` (Single line text)
+- `week_label` (Single line text)
+- `original_filename` (Single line text)
+- `row_count` (Number)
 
-**4. Add credentials to Streamlit secrets**
+**4. Get a Personal Access Token**
+- Go to [airtable.com/create/tokens](https://airtable.com/create/tokens)
+- Scopes: `data.records:read` and `data.records:write`
+- Access: add your `Tatari` base
 
-Create `.streamlit/secrets.toml` in the project folder (see `secrets.toml.example` for the exact format):
+**5. Get your Base ID**
+- From [airtable.com/developers/web/api/introduction](https://airtable.com/developers/web/api/introduction)
+- Click your base — the URL will contain `appXXXXXXXX`
+
+**6. Configure secrets** in `.streamlit/secrets.toml`:
 
 ```toml
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit"
-
-[GOOGLE_CREDENTIALS]
-type = "service_account"
-project_id = "your-project-id"
-private_key_id = "abc123"
-private_key = \"\"\"-----BEGIN RSA PRIVATE KEY-----
-...
------END RSA PRIVATE KEY-----\"\"\"
-client_email = "name@project.iam.gserviceaccount.com"
-client_id = "123456789"
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
+AIRTABLE_BASE_ID = "appXXXXXXXXXXXXXX"
+AIRTABLE_PAT = "patXXXXXXXXXXXXX.YYYYYYYYYYYYYYYYY"
 ```
 
-On **Streamlit Community Cloud** paste the same values under *App settings → Secrets*.
+On Streamlit Community Cloud: paste the same values under
+*App settings → Secrets*.
 
 Then restart the app.
 """)
@@ -693,13 +711,13 @@ def main() -> None:
         layout="wide",
     )
     st.title("📺 Tatari TV Campaign Performance")
-    st.caption("Upload Tatari CSV exports · data stored persistently in Google Sheets")
+    st.caption("Upload Tatari CSV exports · data stored persistently in Airtable")
 
     if not _secrets_configured():
         render_setup_guide()
         return
 
-    if "cache_bust" not in st.session_state:
+    if "_cache_bust" not in st.session_state:
         st.session_state["_cache_bust"] = 0
 
     selected_ts = render_uploader_and_picker()

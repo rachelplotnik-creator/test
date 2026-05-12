@@ -2,7 +2,7 @@
 
 A Streamlit dashboard for analyzing TV campaign performance data exported from
 [Tatari](https://www.tatari.tv/) as CSV files. Uploads are stored persistently
-in a Google Sheet so data survives restarts and re-deployments.
+in [Airtable](https://airtable.com/) so data survives restarts and re-deployments.
 
 ## Quick start
 
@@ -13,59 +13,76 @@ streamlit run app.py
 
 Open <http://localhost:8501>.
 
-## Google Sheets setup (one-time, ~5 minutes)
+## Airtable setup (one-time, ~5 minutes)
 
-### 1 — Create a Google Cloud service account
+### 1. Create an Airtable base
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com)
-2. *APIs & Services → Credentials → Create Credentials → Service Account*
-3. Open the new service account → *Keys → Add Key → JSON* → download the file
+1. Sign up at [airtable.com](https://airtable.com) (free)
+2. Click **+ Create a base** → **Start from scratch** → name it `Tatari`
 
-### 2 — Enable the Google Sheets API
+### 2. Create the `raw_data` table
 
-*APIs & Services → Enable APIs & Services → search "Google Sheets API" → Enable*
+Rename the default `Table 1` to `raw_data` and set up these fields (delete any defaults):
 
-### 3 — Create a Google Sheet and share it
-
-1. Create a new blank sheet at [sheets.google.com](https://sheets.google.com)
-2. *Share* → paste the service account email (e.g. `name@project.iam.gserviceaccount.com`) → **Editor**
-
-The app auto-creates two worksheets the first time it writes:
-
-| Worksheet | Purpose |
+| Field name | Type |
 |---|---|
-| `raw_data` | All campaign rows from every upload, tagged with week label and upload timestamp |
-| `uploads_log` | One row per upload batch (timestamp, week label, filename, row count) |
+| `upload_ts` | Single line text |
+| `week_label` | Single line text |
+| `source_file` | Single line text |
+| `row_data` | Long text |
 
-### 4 — Configure credentials
+### 3. Create the `uploads_log` table
+
+Click **+ Add or import** → **Create empty table** → name it `uploads_log`.
+
+| Field name | Type |
+|---|---|
+| `upload_ts` | Single line text |
+| `week_label` | Single line text |
+| `original_filename` | Single line text |
+| `row_count` | Number (Integer) |
+
+### 4. Get a Personal Access Token
+
+1. Go to [airtable.com/create/tokens](https://airtable.com/create/tokens)
+2. Click **Create new token**
+3. Name: `tatari-dashboard`
+4. **Scopes**: `data.records:read`, `data.records:write`
+5. **Access**: add your `Tatari` base
+6. Create → copy the token (starts with `pat`)
+
+### 5. Get your Base ID
+
+1. Go to [airtable.com/developers/web/api/introduction](https://airtable.com/developers/web/api/introduction)
+2. Click your `Tatari` base — the URL will contain `appXXXXXXXX`
+
+### 6. Configure credentials
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in:
 
 ```toml
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit"
-
-[GOOGLE_CREDENTIALS]
-type = "service_account"
-project_id = "your-project"
-private_key_id = "..."
-private_key = """-----BEGIN RSA PRIVATE KEY-----
-...
------END RSA PRIVATE KEY-----"""
-client_email = "name@project.iam.gserviceaccount.com"
-# ... (copy all fields from the downloaded JSON)
+AIRTABLE_BASE_ID = "appXXXXXXXXXXXXXX"
+AIRTABLE_PAT     = "patXXXXXXXXXXXXX.YYYYYYYYYYYYYYYYY"
 ```
 
 On **Streamlit Community Cloud**: paste the same content under
 *App settings → Secrets* — no file needed.
 
+## Free tier note
+
+Airtable's free plan allows **1,000 records per base**. Each row of your CSV
+becomes one record, so depending on data granularity you'll eventually want
+to either upgrade to Plus ($10/mo for 5k records), prune older batches via
+**Manage uploads → Delete batches**, or switch to a different backend.
+
 ## Features
 
 | Feature | Detail |
 |---|---|
-| CSV upload | Sidebar uploader; rows appended to Google Sheet immediately |
-| Week labelling | Pick the Mon–Sun week the export covers before uploading; stored as `_week_label` |
-| Upload history | Sidebar picker lists every batch by week label + filename; select which to include |
-| Delete batches | Remove an upload batch (rows + log entry) without touching other data |
+| CSV upload | Sidebar uploader; rows pushed to Airtable in batches |
+| Week labelling | Pick the Mon–Sun week the export covers; stored as `week_label` |
+| Upload history | Sidebar picker lists each batch by week label + filename + row count |
+| Delete batches | Removes all records for an upload batch (and the log entry) |
 | Column normalisation | Snake-cases names; synonym map collapses `campaign_name → campaign`, `imps → impressions`, etc. |
 | Deduplication | Same row appearing in multiple exports is stored only once |
 | KPI cards | Total spend, impressions, avg CPE, avg CPM for the most recent complete ISO week |
@@ -73,6 +90,14 @@ On **Streamlit Community Cloud**: paste the same content under
 | Trend charts | Altair line charts for any numeric columns you select |
 | Sidebar filters | Date range + dynamic multiselects for every categorical column |
 | Resilience | Missing columns are skipped; app never crashes on absent metrics |
+
+## How storage works
+
+The Airtable schema is fixed regardless of which Tatari columns appear in
+your exports. Each row is JSON-encoded into the `row_data` long-text field,
+and the app expands it back into a wide DataFrame on load. This means you
+can upload exports with different column sets and the app handles them
+seamlessly.
 
 ## Aggregation rules
 
@@ -91,6 +116,4 @@ requirements.txt                  # Python dependencies
 .streamlit/
     secrets.toml.example          # Credential template (copy → secrets.toml)
     secrets.toml                  # Your credentials (git-ignored)
-data/
-    .gitkeep                      # Keeps the folder in git (legacy, not used)
 ```
