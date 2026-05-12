@@ -74,7 +74,9 @@ UPLOADS_LOG_TABLE = "uploads_log"
 
 def normalize_col(name: str) -> str:
     s = str(name).strip().lower()
-    s = re.sub(r"[^\w%]+", "_", s)
+    # Map "%" to "pct" so Airtable field names stay alphanumeric+underscore.
+    s = s.replace("%", "_pct_")
+    s = re.sub(r"[^\w]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return COLUMN_SYNONYMS.get(s, s)
 
@@ -261,6 +263,37 @@ def _is_permission_error(exc: Exception) -> bool:
     )
 
 
+def _is_rate_limited(exc: Exception) -> bool:
+    """True if the error looks like an Airtable rate-limit (HTTP 429)."""
+    msg = str(exc).upper()
+    return "429" in msg or "RATE_LIMIT" in msg or "TOO_MANY_REQUESTS" in msg
+
+
+def _create_field_with_retry(table, name: str, ftype: str, options: dict | None,
+                              max_attempts: int = 6) -> None:
+    """Call create_field with exponential backoff on rate-limit responses."""
+    import time
+
+    delay = 1.0
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            if options:
+                table.create_field(name, ftype, options=options)
+            else:
+                table.create_field(name, ftype)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _is_rate_limited(exc) and attempt < max_attempts - 1:
+                time.sleep(delay)
+                delay = min(delay * 2, 16.0)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+
+
 def ensure_data_fields(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """Create raw_data fields for any CSV columns that don't exist yet.
 
@@ -277,10 +310,7 @@ def ensure_data_fields(df: pd.DataFrame) -> tuple[list[str], list[str]]:
             continue
         ftype, options = _infer_airtable_type(df[col])
         try:
-            if options:
-                table.create_field(col, ftype, options=options)
-            else:
-                table.create_field(col, ftype)
+            _create_field_with_retry(table, col, ftype, options)
             existing.add(col)
             created.append(col)
         except Exception as exc:  # noqa: BLE001
@@ -294,7 +324,7 @@ def ensure_data_fields(df: pd.DataFrame) -> tuple[list[str], list[str]]:
                 ) from exc
             # Type was likely rejected (e.g. mixed data) — fall back to text.
             try:
-                table.create_field(col, "singleLineText")
+                _create_field_with_retry(table, col, "singleLineText", None)
                 existing.add(col)
                 created.append(col)
             except Exception as exc2:  # noqa: BLE001
