@@ -4,8 +4,10 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Streamlit secrets — never commit real credentials
 .streamlit/secrets.toml
 
-# Locally-uploaded Tatari CSVs are user data; keep them out of git.
+# Local CSV data folder (legacy, no longer used)
 data/*
 !data/.gitkeep
