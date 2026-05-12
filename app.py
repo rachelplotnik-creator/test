@@ -312,9 +312,12 @@ def load_selected_batches(selected_ts: list[str]) -> pd.DataFrame:
     raw = raw.drop(columns=[c for c in ["_record_id"] if c in raw.columns])
     df = coerce_dates(raw)
 
-    # Dedupe again just in case (cheap insurance).
+    # Dedupe again just in case (cheap insurance). Guard against the case
+    # where every column is a meta column (records with empty row_data),
+    # which would make ``drop_duplicates(subset=[])`` blow up.
     dedupe_cols = [c for c in df.columns if c not in META_COLS]
-    df = df.drop_duplicates(subset=dedupe_cols, keep="first")
+    if dedupe_cols:
+        df = df.drop_duplicates(subset=dedupe_cols, keep="first")
     return df.reset_index(drop=True)
 
 
