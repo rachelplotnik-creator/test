@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Streamlit secrets — never commit real credentials
+.streamlit/secrets.toml
+
+# Local CSV data folder (legacy, no longer used)
+data/*
+!data/.gitkeep
