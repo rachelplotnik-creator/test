@@ -22,14 +22,15 @@ Open <http://localhost:8501>.
 
 ### 2. Create the `raw_data` table
 
-Rename the default `Table 1` to `raw_data` and set up these fields (delete any defaults):
+Rename the default `Table 1` to `raw_data` and set up these fields (delete
+any defaults). The app will **auto-create one Airtable field per CSV column**
+on first upload, so you only need these three meta fields up front:
 
 | Field name | Type |
 |---|---|
 | `upload_ts` | Single line text |
 | `week_label` | Single line text |
 | `source_file` | Single line text |
-| `row_data` | Long text |
 
 ### 3. Create the `uploads_log` table
 
@@ -47,7 +48,12 @@ Click **+ Add or import** → **Create empty table** → name it `uploads_log`.
 1. Go to [airtable.com/create/tokens](https://airtable.com/create/tokens)
 2. Click **Create new token**
 3. Name: `tatari-dashboard`
-4. **Scopes**: `data.records:read`, `data.records:write`
+4. **Scopes** (all four are required — the schema scopes let the app
+   create new fields automatically when your CSV has new columns):
+   - `data.records:read`
+   - `data.records:write`
+   - `schema.bases:read`
+   - `schema.bases:write`
 5. **Access**: add your `Tatari` base
 6. Create → copy the token (starts with `pat`)
 
@@ -93,11 +99,19 @@ to either upgrade to Plus ($10/mo for 5k records), prune older batches via
 
 ## How storage works
 
-The Airtable schema is fixed regardless of which Tatari columns appear in
-your exports. Each row is JSON-encoded into the `row_data` long-text field,
-and the app expands it back into a wide DataFrame on load. This means you
-can upload exports with different column sets and the app handles them
-seamlessly.
+Each CSV column becomes a real Airtable field, with a sensible type:
+
+- Numeric columns (`spend`, `impressions`, ...) → **Number**
+- Date columns (`date`, `air_date`, ...) → **Date** (ISO format)
+- Everything else → **Single line text** (or **Long text** for long values)
+
+On every upload, the app checks the `raw_data` table schema and creates any
+missing fields automatically. That means you can upload Tatari exports with
+different columns sets across weeks and the table will grow to accommodate
+them — and the data is also browsable/sortable directly in Airtable.
+
+Legacy records that used a `row_data` JSON blob (from earlier versions of
+the app) are still read correctly.
 
 ## Aggregation rules
 

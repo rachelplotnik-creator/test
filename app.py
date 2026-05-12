@@ -159,12 +159,23 @@ def _table(name: str):
     return _airtable_api().table(st.secrets["AIRTABLE_BASE_ID"], name)
 
 
+def _table_with_schema(name: str):
+    """Like _table, but goes through the Base object so .schema() works."""
+    api = _airtable_api()
+    base = api.base(st.secrets["AIRTABLE_BASE_ID"])
+    return base.table(name)
+
+
 # ---------------------------------------------------------------------------
 # Storage operations
 # ---------------------------------------------------------------------------
 
-def _row_to_jsonable(row: dict) -> dict:
-    """Convert a pandas row dict to plain JSON-serialisable types."""
+# Reserved field names in the raw_data table — never touched by schema sync.
+RESERVED_FIELDS = {"upload_ts", "week_label", "source_file", "row_data"}
+
+
+def _row_to_airtable(row: dict) -> dict:
+    """Convert a pandas row dict to types Airtable accepts natively."""
     out: dict = {}
     for k, v in row.items():
         if pd.isna(v):
@@ -186,9 +197,100 @@ def _row_to_jsonable(row: dict) -> dict:
     return out
 
 
+# Cache schema lookups for a single Streamlit run.
+_SCHEMA_CACHE: dict[str, set[str]] = {}
+
+
+def _existing_field_names(table_name: str, refresh: bool = False) -> set[str]:
+    """Return the set of field names currently defined in an Airtable table."""
+    if not refresh and table_name in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[table_name]
+    table = _table_with_schema(table_name)
+    schema = table.schema()
+    names = {f.name for f in schema.fields}
+    _SCHEMA_CACHE[table_name] = names
+    return names
+
+
+def _infer_airtable_type(series: pd.Series) -> tuple[str, dict | None]:
+    """Pick an Airtable field type + options for a pandas column."""
+    s = series.dropna()
+    if s.empty:
+        return "singleLineText", None
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "date", {"dateFormat": {"name": "iso"}}
+
+    if pd.api.types.is_numeric_dtype(series):
+        # Integer-only column gets precision 0; otherwise 2 decimal places.
+        try:
+            is_int = (s == s.astype("int64")).all()
+        except (TypeError, ValueError):
+            is_int = False
+        return "number", {"precision": 0 if is_int else 2}
+
+    # Try parsing string values as dates
+    parsed = pd.to_datetime(s, errors="coerce")
+    if len(parsed) and parsed.notna().mean() > 0.9:
+        return "date", {"dateFormat": {"name": "iso"}}
+
+    # Try parsing string values as numbers
+    coerced = pd.to_numeric(s, errors="coerce")
+    if len(coerced) and coerced.notna().mean() > 0.9:
+        try:
+            is_int = (coerced.dropna() == coerced.dropna().astype("int64")).all()
+        except (TypeError, ValueError):
+            is_int = False
+        return "number", {"precision": 0 if is_int else 2}
+
+    # Fall back to text — use multilineText if values are long
+    if s.astype(str).str.len().max() > 200:
+        return "multilineText", None
+    return "singleLineText", None
+
+
+def ensure_data_fields(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Create raw_data fields for any CSV columns that don't exist yet.
+
+    Returns (created_field_names, skipped_field_names_due_to_error).
+    """
+    existing = _existing_field_names(RAW_DATA_TABLE)
+    table = _table_with_schema(RAW_DATA_TABLE)
+
+    created: list[str] = []
+    skipped: list[str] = []
+    for col in df.columns:
+        if col in RESERVED_FIELDS or col in existing or col in META_COLS:
+            continue
+        ftype, options = _infer_airtable_type(df[col])
+        try:
+            if options:
+                table.create_field(col, ftype, options=options)
+            else:
+                table.create_field(col, ftype)
+            existing.add(col)
+            created.append(col)
+        except Exception:  # noqa: BLE001
+            # Fall back to a single-line text field if the inferred type
+            # was rejected (e.g. mixed data).
+            try:
+                table.create_field(col, "singleLineText")
+                existing.add(col)
+                created.append(col)
+            except Exception:  # noqa: BLE001
+                skipped.append(col)
+
+    _SCHEMA_CACHE[RAW_DATA_TABLE] = existing
+    return created, skipped
+
+
 @st.cache_data(show_spinner=False, ttl=60)
 def _load_raw_data(cache_bust: int) -> pd.DataFrame:  # noqa: ARG001
-    """Read all rows from the raw_data table and explode JSON back to columns."""
+    """Read all rows from the raw_data table into a wide DataFrame.
+
+    Supports both new-style records (CSV columns stored as real Airtable
+    fields) and legacy records (data in a ``row_data`` JSON blob).
+    """
     records = _table(RAW_DATA_TABLE).all()
     if not records:
         return pd.DataFrame()
@@ -196,16 +298,29 @@ def _load_raw_data(cache_bust: int) -> pd.DataFrame:  # noqa: ARG001
     rows: list[dict] = []
     for rec in records:
         fields = rec.get("fields", {})
+        row: dict = {}
+
+        # Legacy: row_data was a JSON blob — expand it first so real fields
+        # below take precedence on key collision.
         row_blob = fields.get("row_data", "")
-        try:
-            row = json.loads(row_blob) if row_blob else {}
-        except json.JSONDecodeError:
-            row = {}
-        # Promote meta fields from the Airtable record itself onto the row.
-        row["_upload_ts"] = fields.get("upload_ts", "")
-        row["_week_label"] = fields.get("week_label", "")
+        if row_blob:
+            try:
+                blob = json.loads(row_blob)
+                if isinstance(blob, dict):
+                    row.update(blob)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Copy every real Airtable field except the reserved meta ones.
+        for k, v in fields.items():
+            if k in RESERVED_FIELDS:
+                continue
+            row[k] = v
+
+        row["_upload_ts"]   = fields.get("upload_ts", "")
+        row["_week_label"]  = fields.get("week_label", "")
         row["_source_file"] = fields.get("source_file", "")
-        row["_record_id"] = rec.get("id", "")
+        row["_record_id"]   = rec.get("id", "")
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -234,10 +349,15 @@ def _invalidate_cache() -> None:
     st.session_state["_cache_bust"] = st.session_state.get("_cache_bust", 0) + 1
     _load_raw_data.clear()
     _load_uploads_log.clear()
+    _SCHEMA_CACHE.clear()
+
+
+class SchemaPermissionError(RuntimeError):
+    """Raised when the PAT lacks schema.bases:write scope."""
 
 
 def upload_to_airtable(uploaded_file, week_label: str, upload_ts: str) -> int:
-    """Parse a CSV, dedupe vs existing data, and batch-create new records.
+    """Parse a CSV, sync table schema, dedupe vs existing, and write rows.
 
     Returns the number of new records actually written.
     """
@@ -245,31 +365,51 @@ def upload_to_airtable(uploaded_file, week_label: str, upload_ts: str) -> int:
     raw.columns = [normalize_col(c) for c in raw.columns]
     raw = coerce_dates(raw)
 
-    # Build dedupe signature for each new row from its data columns only.
-    new_rows = [_row_to_jsonable(r) for r in raw.to_dict(orient="records")]
+    # Sync schema: create Airtable fields for any new columns
+    try:
+        ensure_data_fields(raw)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "401" in msg or "403" in msg or "INVALID_PERMISSIONS" in msg or "NOT_AUTHORIZED" in msg:
+            raise SchemaPermissionError(
+                "Your Airtable token can't modify the table schema. "
+                "Update the token at airtable.com/create/tokens to include "
+                "'schema.bases:read' and 'schema.bases:write' scopes, then "
+                "paste the new token into .streamlit/secrets.toml."
+            ) from exc
+        raise
+
+    # Build dedupe signature from the current data columns
+    data_cols = [c for c in raw.columns if c not in RESERVED_FIELDS]
+    new_rows = [_row_to_airtable({k: r.get(k) for k in data_cols})
+                for r in raw.to_dict(orient="records")]
     new_signatures = [
         json.dumps(r, sort_keys=True, default=str) for r in new_rows
     ]
 
-    # Pull existing signatures so we can dedupe before writing.
     existing = _load_raw_data(st.session_state.get("_cache_bust", 0))
     existing_sigs: set[str] = set()
     if not existing.empty:
-        data_cols = [c for c in existing.columns if c not in META_COLS and c != "_record_id"]
-        for r in existing[data_cols].to_dict(orient="records"):
-            existing_sigs.add(json.dumps(_row_to_jsonable(r), sort_keys=True, default=str))
+        existing_data_cols = [
+            c for c in existing.columns
+            if c not in META_COLS and c != "_record_id" and c in data_cols
+        ]
+        if existing_data_cols:
+            for r in existing[existing_data_cols].to_dict(orient="records"):
+                existing_sigs.add(json.dumps(_row_to_airtable(r), sort_keys=True, default=str))
 
-    new_records = []
+    new_records: list[dict] = []
     for row, sig in zip(new_rows, new_signatures):
         if sig in existing_sigs:
             continue
         existing_sigs.add(sig)
-        new_records.append({
-            "upload_ts":  upload_ts,
-            "week_label": week_label,
+        rec = {
+            "upload_ts":   upload_ts,
+            "week_label":  week_label,
             "source_file": uploaded_file.name,
-            "row_data":   json.dumps(row, default=str),
-        })
+        }
+        rec.update(row)
+        new_records.append(rec)
 
     if new_records:
         _table(RAW_DATA_TABLE).batch_create(new_records, typecast=True)
@@ -606,6 +746,8 @@ def render_uploader_and_picker() -> list[str]:
                 try:
                     added = upload_to_airtable(f, wlabel, upload_ts)
                     st.sidebar.success(f"{wlabel} · {f.name} (+{added:,} rows)")
+                except SchemaPermissionError as exc:
+                    st.sidebar.error(str(exc))
                 except Exception as exc:  # noqa: BLE001
                     st.sidebar.error(f"Failed: {exc}")
         _invalidate_cache()
@@ -668,11 +810,11 @@ def render_setup_guide() -> None:
 - Sign up at [airtable.com](https://airtable.com) (free)
 - Create a base called `Tatari`
 
-**2. Create the `raw_data` table** with these fields:
+**2. Create the `raw_data` table** with these fields (CSV column fields
+   will be added automatically on first upload):
 - `upload_ts` (Single line text)
 - `week_label` (Single line text)
 - `source_file` (Single line text)
-- `row_data` (Long text)
 
 **3. Create the `uploads_log` table** with these fields:
 - `upload_ts` (Single line text)
@@ -680,10 +822,14 @@ def render_setup_guide() -> None:
 - `original_filename` (Single line text)
 - `row_count` (Number)
 
-**4. Get a Personal Access Token**
+**4. Create a Personal Access Token**
 - Go to [airtable.com/create/tokens](https://airtable.com/create/tokens)
-- Scopes: `data.records:read` and `data.records:write`
-- Access: add your `Tatari` base
+- **Scopes**:
+  - `data.records:read`
+  - `data.records:write`
+  - `schema.bases:read`
+  - `schema.bases:write`
+- **Access**: add your `Tatari` base
 
 **5. Get your Base ID**
 - From [airtable.com/developers/web/api/introduction](https://airtable.com/developers/web/api/introduction)
